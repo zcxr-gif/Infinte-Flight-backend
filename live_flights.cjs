@@ -2406,6 +2406,84 @@ app.get('/api/users/:userId/stats', async (req, res) => {
   }
 });
 
+// The same block, found by the name a pilot types rather than by an id.
+//
+// Every other route here starts from a userId because that is what the live
+// feed carries. A person setting up a profile has no idea what their userId is
+// — they know the name they signed into Infinite Flight with — so this takes
+// the Discourse handle, resolves it through POST /users, and then answers
+// exactly as `/api/users/:userId/stats` does. That makes it a *check* as well
+// as a read: a name with no account behind it 404s, which is the only way the
+// app can tell somebody they have mistyped their own username before they wear
+// it on a public profile.
+//
+// Cached under the resolved id as well as the name, so the two routes share
+// one entry and a lookup by name warms the one the flight window uses.
+app.get('/api/pilots/:username/stats', async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  if (!username) return res.status(400).json(err(400, 'Missing username'));
+
+  const nameKey = `userStatsByName:${username.toLowerCase()}`;
+  const cachedByName = getOnDemandCached(nameKey);
+  if (cachedByName) {
+    return res.json({ ok: true, userId: cachedByName.userId, username: cachedByName.username, stats: cachedByName.stats, fromCache: true });
+  }
+
+  try {
+    // One call, and it is the resolution: POST /users by discourseNames is the
+    // only IF endpoint that maps a name to an id.
+    const matches = await getUserStats({ discourseNames: [username] });
+    const globalStats = Array.isArray(matches) ? matches[0] : null;
+    const userId = globalStats?.userId || null;
+
+    if (!userId) {
+      return res.status(404).json(err(404, 'No Infinite Flight account with that username.'));
+    }
+
+    // The grade block is a second call and is allowed to fail: a pilot whose
+    // name resolved is a pilot we can answer for, and the grade detail is the
+    // richer half rather than the whole answer.
+    const userGrade = await getUserGrade(userId).catch(() => null);
+
+    const statsPayload = {
+      virtualOrganization: userGrade?.virtualOrganization || globalStats.virtualOrganization || null,
+      discourseUsername: userGrade?.discourseUsername || globalStats.discourseUsername || username,
+      groups: userGrade?.groups,
+      roles: userGrade?.roles,
+      gradeDetails: userGrade?.gradeDetails,
+
+      grade: resolveGrade(userGrade?.gradeDetails, globalStats.grade),
+      calculatedGrade: resolveGrade(userGrade?.gradeDetails, globalStats.grade),
+
+      violationCountByLevel: userGrade?.violationCountByLevel,
+      totalXP: userGrade?.totalXP ?? globalStats.xp ?? null,
+      atcOperations: userGrade?.atcOperations ?? globalStats.atcOperations ?? null,
+      atcRank: userGrade?.atcRank ?? globalStats.atcRank ?? null,
+      total12MonthsViolations: userGrade?.total12MonthsViolations,
+
+      flightTime: globalStats.flightTime || 0,
+      landingCount: globalStats.landingCount || 0,
+      onlineFlights: globalStats.onlineFlights || 0,
+      violations: globalStats.violations || 0
+    };
+
+    const answer = { userId, username: statsPayload.discourseUsername, stats: statsPayload };
+    setOnDemandCached(nameKey, answer, 5 * 60 * 1000);
+    setOnDemandCached(`userStats:${userId}`, { userId, stats: statsPayload }, 5 * 60 * 1000);
+
+    res.json({ ok: true, ...answer });
+  } catch (e) {
+    const status = e?.response?.status || 500;
+    const apiError = e?.response?.data;
+    res.status(status).json(
+      err(status, 'Failed to look that username up', {
+        apiErrorCode: apiError?.errorCode,
+        detail: e?.message
+      })
+    );
+  }
+});
+
 app.get('/api/flights/:flightId/history', async (req, res) => {
   try {
     // Optional watermark: clients pass the lastReportMs of their most recent
