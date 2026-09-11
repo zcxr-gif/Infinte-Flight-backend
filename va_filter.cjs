@@ -540,25 +540,110 @@ const pending = new Map(); // flightId -> { air: bool, n: int } (flip being conf
 // offered" and resolves the flight against its own rosters.
 const ROSTER_ONLY_CFG = { code: '', name: '', prefixes: [], suffixes: [], regulars: [], match: 'strict', hubs: [], servers: [] };
 
+/* ---- filed flight plan (the route the card draws) ---- */
+
+// The other backend draws the route on the card it posts to Discord. Given only
+// departure and arrival it can draw one straight line between them, which is not
+// where the aeroplane is going: a filed plan is a SID, a set of airways and a
+// STAR, and the great-circle between the two airports can sit hundreds of miles
+// off it. So the plan is forwarded WITH the event, and the card draws the real
+// thing.
+//
+// Injected rather than required: this module is pure matching + push, and the
+// Infinite Flight client (with its API key, its rate limits and its caches)
+// lives in live_flights.cjs. initEventEngine({ getFlightPlan }) hands it in;
+// without it every event still forwards, just with no plan on it.
+let planFetcher = null;
+
+// A plan is worth a few hundred bytes on the wire, not a few hundred kilobytes.
+// A filed route is tens of fixes; the cap is a bound on a pathological one (or a
+// malformed response), and coordinates are rounded to ~1 m, which is far finer
+// than a map 1,200 px wide can draw.
+const MAX_PLAN_WAYPOINTS = 200;
+const round5 = (n) => Math.round(n * 1e5) / 1e5;
+
+// Flatten Infinite Flight's flight-plan TREE into the ordered list of fixes that
+// actually carry coordinates. A SID/STAR arrives as ONE item holding its fixes
+// as `children`, and only the leaves have a location — so the parents are walked
+// through, never drawn. Mirrors simplifyFlightPlan in live_flights.cjs; kept
+// here as well so the event path does not depend on that module's shape.
+function flattenPlanItems(items, out = []) {
+  if (!Array.isArray(items)) return out;
+  for (const item of items) {
+    if (out.length >= MAX_PLAN_WAYPOINTS) break;
+    if (Array.isArray(item?.children) && item.children.length) {
+      flattenPlanItems(item.children, out);
+      continue;
+    }
+    const loc = item?.location;
+    const lat = Number(loc?.latitude);
+    const lon = Number(loc?.longitude);
+    // (0,0) is what the API reports for a fix it could not resolve, not a point
+    // in the Gulf of Guinea every third flight plan routes through.
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    if (lat === 0 && lon === 0) continue;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+    out.push({
+      name: String(item?.name || '').trim().slice(0, 12) || null,
+      lat: round5(lat),
+      lon: round5(lon),
+    });
+  }
+  return out;
+}
+
+// The filed plan for one flight as { id, waypoints: [...] }, or null when the
+// pilot filed nothing, the fetcher is not wired up, or the lookup failed.
+// NEVER throws and never rejects: a plan is an enrichment, and an event must go
+// out with or without one.
+async function fetchPlanFor(sessionId, flightId) {
+  if (typeof planFetcher !== 'function' || !sessionId || !flightId) return null;
+  try {
+    const raw = await planFetcher(sessionId, flightId);
+    const waypoints = flattenPlanItems(raw?.flightPlanItems);
+    if (!waypoints.length) return null;
+    return { id: raw?.flightPlanId || null, waypoints };
+  } catch (e) {
+    console.warn(`[va-filter] ⚠️ flight plan lookup failed for ${flightId}: ${e.message}`);
+    return null;
+  }
+}
+
 // POST a single takeoff/landing event to the other backend. Fire-and-forget:
 // never awaited on the poll path, never cached.
-function pushEvent(type, flight, serverName, cfg) {
+//
+// The one thing awaited INSIDE it is the flight plan, and only far enough to put
+// it on the payload. The poller is never held up: this returns its promise to a
+// caller that does not wait on it, exactly as the bare axios.post did.
+async function pushEvent(type, flight, serverName, cfg, sessionId) {
   const url = process.env.VA_BOT_FORWARD_URL;
   if (!url) return;
+  const flightPlan = await fetchPlanFor(sessionId, flight?.flightId);
   const payload = {
     event: type, // 'takeoff' | 'landing'
     va: { code: cfg.code, name: cfg.name },
     callsign: flight?.callsign || '',
     username: flight?.username || null,
     flightId: flight?.flightId || null,
+    sessionId: sessionId || null,
     server: serverName || null,
     departureIcao: flight?.departureIcao || null,
     arrivalIcao: flight?.arrivalIcao || null,
     position: flight?.position || null,
     aircraft: flight?.aircraft || null,
+    // The filed route, flattened to the fixes that carry coordinates, so the
+    // card can plot the whole plan instead of a straight line A->B. Null when
+    // the pilot filed nothing.
+    flightPlan,
+    // True when this pilot is on the roster watch list — a VA has said its
+    // members' flights count whatever callsign they wear. The other backend owns
+    // attribution and holds the rosters; this is only a hint that the roster
+    // path is worth walking even though a callsign already claimed the flight,
+    // which is exactly the codeshare case (partner metal, VA tag, VA roster).
+    rosterWatched: isWatchedPilot(flight?.username),
     timestamp: Date.now(),
   };
-  axios
+  return axios
     .post(url, payload, {
       timeout: 8000,
       headers: process.env.VA_BOT_FORWARD_TOKEN
@@ -623,7 +708,10 @@ function processSnapshot(flightsCache, claimEvent) {
         pending.delete(f.flightId);
         const type = cur ? 'takeoff' : 'landing';
         // Only send if we haven't already sent this exact state for this flight.
-        if (claim(f.flightId, type)) pushEvent(type, f, payload?.server, cfg);
+        // pushEvent is async only because it looks the filed plan up first; it is
+        // deliberately NOT awaited, so the poll loop never waits on the Infinite
+        // Flight API. It swallows its own failures.
+        if (claim(f.flightId, type)) pushEvent(type, f, payload?.server, cfg, payload?.sessionId);
       }
     }
   }
@@ -635,8 +723,14 @@ function processSnapshot(flightsCache, claimEvent) {
 }
 
 // Start the VA-list refresh loop. Inert (logs once) if no source is configured.
+//
+// `getFlightPlan(sessionId, flightId)` is optional and, when given, is what every
+// forwarded event's filed route comes from (see fetchPlanFor). Pass the caching
+// fetcher rather than a raw API call: one lookup fires per takeoff and per
+// landing, against the same rate limit the website is spending.
 let started = false;
-function initEventEngine() {
+function initEventEngine({ getFlightPlan } = {}) {
+  if (typeof getFlightPlan === 'function') planFetcher = getFlightPlan;
   if (started) return;
   started = true;
   refreshVaConfigs();
@@ -770,4 +864,7 @@ module.exports = {
   processSnapshot,
   initEventEngine,
   registerRoutes,
+  // Flight-plan flattening — exported for the tests, which drive it directly
+  // rather than through the Infinite Flight API.
+  flattenPlanItems,
 };
