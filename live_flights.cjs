@@ -705,7 +705,31 @@ async function fetchVaRoster() {
 
 // Start fetching the all-VA callsign configs used by the takeoff/landing event
 // engine. Inert unless VA_BACKEND_URL / VA_LIST_URL is set. See va_filter.cjs.
-vaFilter.initEventEngine();
+//
+// The engine is also handed a flight-plan fetcher, so every takeoff/landing it
+// forwards carries the pilot's FILED ROUTE and the card on the other side can
+// draw the plan instead of a straight line between the two airports.
+//
+// It goes through the SAME on-demand cache key the /plan routes use
+// (`plan:<session>:<flight>`), for the same reason those two share it: a plan
+// fetched for an event is a plan the website then gets free, against one call to
+// the Infinite Flight API instead of two. "This pilot filed nothing" is
+// remembered under its own key so a planless flight is not re-asked twice per
+// flight (takeoff and landing) for an answer that will not change.
+vaFilter.initEventEngine({
+  getFlightPlan: async (sessionId, flightId) => {
+    const cacheKey = `plan:${sessionId}:${flightId}`;
+    const cached = getOnDemandCached(cacheKey);
+    if (cached) return cached;
+    const noPlanKey = `plan:none:${sessionId}:${flightId}`;
+    if (getOnDemandCached(noPlanKey)) return null;
+
+    const raw = await getFlightPlan(sessionId, flightId);
+    if (raw) setOnDemandCached(cacheKey, raw, 10 * 60 * 1000);
+    else setOnDemandCached(noPlanKey, true, 10 * 60 * 1000);
+    return raw;
+  },
+});
 /* =========================
  * Helpers
  * ========================= */

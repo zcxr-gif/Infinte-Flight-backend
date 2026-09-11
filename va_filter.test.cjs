@@ -24,6 +24,7 @@
 const assert = require('assert');
 const {
   normalizeConfig, callsignMatches, matchMode, setVaConfigs, setRosterWatch, isWatchedPilot,
+  flattenPlanItems,
 } = require('./va_filter.cjs');
 
 const tests = [];
@@ -302,6 +303,71 @@ test('an empty watch list watches nobody', () => {
   assert.strictEqual(isWatchedPilot('John Doe'), false);
   setRosterWatch(null);
   assert.strictEqual(isWatchedPilot('John Doe'), false);
+});
+
+/* =========================
+ * Filed flight plan (forwarded with every event)
+ * ========================= */
+
+// Coordinates are rounded on the way out; compare against the rounded form.
+const wp = (name, lat, lon) => ({ name, lat, lon });
+
+test('a plan flattens to its fixes, in order', () => {
+  const items = [
+    { name: 'EGLL', location: { latitude: 51.4775, longitude: -0.4614 } },
+    { name: 'DET', location: { latitude: 51.3033, longitude: 0.5975 } },
+    { name: 'KJFK', location: { latitude: 40.6398, longitude: -73.7789 } },
+  ];
+  assert.deepStrictEqual(flattenPlanItems(items), [
+    wp('EGLL', 51.4775, -0.4614),
+    wp('DET', 51.3033, 0.5975),
+    wp('KJFK', 40.6398, -73.7789),
+  ]);
+});
+
+test('a SID/STAR contributes its fixes, not the procedure itself', () => {
+  // The procedure carries no location of its own — only its children do, and
+  // drawing the parent would put a fix at (0,0) in the middle of the route.
+  const items = [
+    { name: 'EGLL', location: { latitude: 51.4775, longitude: -0.4614 } },
+    {
+      name: 'CPT3F',
+      location: { latitude: 0, longitude: 0 },
+      children: [
+        { name: 'WOBUN', location: { latitude: 51.98, longitude: -0.61 } },
+        { name: 'CPT', location: { latitude: 51.4975, longitude: -1.215 } },
+      ],
+    },
+  ];
+  assert.deepStrictEqual(flattenPlanItems(items), [
+    wp('EGLL', 51.4775, -0.4614),
+    wp('WOBUN', 51.98, -0.61),
+    wp('CPT', 51.4975, -1.215),
+  ]);
+});
+
+test('unresolved fixes are dropped, not drawn in the Gulf of Guinea', () => {
+  const items = [
+    { name: 'KSEA', location: { latitude: 47.4502, longitude: -122.3088 } },
+    { name: 'BROKEN', location: { latitude: 0, longitude: 0 } },
+    { name: 'NOLOC' },
+    { name: 'OFFWORLD', location: { latitude: 999, longitude: 12 } },
+    { name: 'KPDX', location: { latitude: 45.5887, longitude: -122.5975 } },
+  ];
+  assert.deepStrictEqual(flattenPlanItems(items).map((w) => w.name), ['KSEA', 'KPDX']);
+});
+
+test('a pathological plan is capped rather than forwarded whole', () => {
+  const items = Array.from({ length: 500 }, (_, i) => ({
+    name: `F${i}`, location: { latitude: 10 + i / 1000, longitude: 20 },
+  }));
+  assert.strictEqual(flattenPlanItems(items).length, 200);
+});
+
+test('no plan at all is an empty list, never a throw', () => {
+  assert.deepStrictEqual(flattenPlanItems(undefined), []);
+  assert.deepStrictEqual(flattenPlanItems(null), []);
+  assert.deepStrictEqual(flattenPlanItems([]), []);
 });
 
 /* =========================
