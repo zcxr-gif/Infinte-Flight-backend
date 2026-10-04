@@ -8,7 +8,6 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'flight_history.db');
 
 // Tunables — change these in one place if you ever need to.
-const MAX_POINTS_PER_FLIGHT = 1500; // was 3000 — halved, since per-point cost dropped ~45%
 const MAX_SESSIONS_PER_FLIGHT = 3;
 const SESSION_GAP_MS = 30 * 60 * 1000;
 const CRUISE_THROTTLE_MS = 120000;
@@ -40,6 +39,14 @@ const intEnv = (name, dflt) => {
 const RETENTION_HOURS = intEnv('HISTORY_RETENTION_HOURS', 24 * 14);
 const RETENTION_MS = RETENTION_HOURS * 60 * 60 * 1000;
 const MAX_DB_BYTES = intEnv('HISTORY_MAX_DB_MB', 4096) * 1024 * 1024;
+
+/* --- Points per flight ---
+ * There is no cap. Every point the recorder accepts is kept for the life of the
+ * flight. A cap used to drop the oldest points once a trail passed 1500, which
+ * cut the departure off any long flight flown below the cruise throttle. The
+ * throttling in shouldSkipPoint already bounds a trail: a 15-hour flight is a
+ * couple of thousand points, a few bytes each once chunked.
+ */
 
 /* --- Chunking ---
  * Points accumulate in a small hot tail on the flight's own row, which is the
@@ -442,6 +449,29 @@ function getDistanceNM(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
+// Faster than anything in Infinite Flight, Concorde with a jet stream behind
+// it included. A jump that would need more than this is a different flight.
+const TELEPORT_MIN_NM = 50;
+const TELEPORT_MIN_KT = 1500;
+
+/**
+ * Does p2 start a new session after p1?
+ *
+ * A long time gap, or a jump no aircraft could fly in the time between the two
+ * points. Distance alone is not enough: points are 15 s apart near the ground
+ * but 2 min apart in cruise, so a few missed polls (a 429 backoff, a redeploy)
+ * put two honest cruise points 50+ nm apart. Read as a "teleport", that marked
+ * a session break, and on the third one enforceTrailLimits deleted everything
+ * before it — the front of the flight, gone, while the pilot was still flying.
+ */
+function isSessionBreak(p1, p2, sessionGapMs = SESSION_GAP_MS) {
+  const dtMs = p2.time - p1.time;
+  if (dtMs > sessionGapMs) return true;
+  const nm = getDistanceNM(p1.lat, p1.lon, p2.lat, p2.lon);
+  if (nm <= TELEPORT_MIN_NM) return false;
+  return dtMs <= 0 || nm / (dtMs / 3600000) > TELEPORT_MIN_KT;
+}
+
 /**
  * Keeps only the last N flight sessions within the path array.
  */
@@ -451,13 +481,7 @@ function trimFlightSessions(pathArray, maxSessions = MAX_SESSIONS_PER_FLIGHT, se
   const sessionBoundaries = [];
 
   for (let i = 1; i < pathArray.length; i++) {
-    const p1 = pathArray[i - 1];
-    const p2 = pathArray[i];
-
-    const isTimeGap = (p2.time - p1.time) > sessionGapMs;
-    const isTeleport = getDistanceNM(p1.lat, p1.lon, p2.lat, p2.lon) > 50;
-
-    if (isTimeGap || isTeleport) {
+    if (isSessionBreak(pathArray[i - 1], pathArray[i], sessionGapMs)) {
       sessionBoundaries.push(i);
     }
   }
@@ -466,10 +490,6 @@ function trimFlightSessions(pathArray, maxSessions = MAX_SESSIONS_PER_FLIGHT, se
     const sessionsToRemove = sessionBoundaries.length - maxSessions + 1;
     const sliceIndex = sessionBoundaries[sessionsToRemove - 1];
     pathArray = pathArray.slice(sliceIndex);
-  }
-
-  if (pathArray.length > MAX_POINTS_PER_FLIGHT) {
-    return pathArray.slice(-MAX_POINTS_PER_FLIGHT);
   }
 
   return pathArray;
@@ -487,10 +507,6 @@ const insertChunkStmt = db.prepare(
   'INSERT OR REPLACE INTO flight_path_chunks (flightId, seq, points, chunk) VALUES (?, ?, ?, ?)'
 );
 const deleteFlightChunksStmt = db.prepare('DELETE FROM flight_path_chunks WHERE flightId = ?');
-const listChunkSizesStmt = db.prepare(
-  'SELECT seq, points FROM flight_path_chunks WHERE flightId = ? ORDER BY seq'
-);
-const dropChunkStmt = db.prepare('DELETE FROM flight_path_chunks WHERE flightId = ? AND seq = ?');
 const selectFlightRowStmt = db.prepare(
   'SELECT path_json, tail_blob FROM flight_history WHERE flightId = ?'
 );
@@ -596,49 +612,30 @@ function runDeepClean(batchSize = 500) {
 function countSessionBreaks(pathArray) {
   let breaks = 0;
   for (let i = 1; i < pathArray.length; i++) {
-    const p1 = pathArray[i - 1];
-    const p2 = pathArray[i];
-    if ((p2.time - p1.time) > SESSION_GAP_MS || getDistanceNM(p1.lat, p1.lon, p2.lat, p2.lon) > 50) {
-      breaks++;
-    }
+    if (isSessionBreak(pathArray[i - 1], pathArray[i])) breaks++;
   }
   return breaks;
 }
 
 /**
- * Applies the size and session limits to a flight that has just sealed a chunk.
+ * Applies the session limit to a flight that has just sealed a chunk.
  *
- * The cheap case — too many points — drops whole chunk rows off the front,
- * which needs no decoding at all. Only a flight that has accumulated more
- * sessions than we keep gets the full decode-trim-rewrite, and that needs three
- * separate departures logged under one flightId to trigger.
- *
- * Limits are therefore enforced at chunk granularity: a trail can run up to
- * CHUNK_POINTS over MAX_POINTS_PER_FLIGHT before the next seal pulls it back.
- * That slack is the entire point — it is what keeps the common poll O(1).
+ * Only a flight with more genuine sessions (see isSessionBreak) logged under
+ * one flightId than we keep pays the decode-trim-rewrite; every other seal is a
+ * single counter check, which is what keeps the common poll O(1).
  */
 function enforceTrailLimits(flightId, state) {
-  if (state.sessionBreaks >= MAX_SESSIONS_PER_FLIGHT) {
-    const trimmed = trimFlightSessions(assemblePath(flightId, { tail_blob: null }));
-    const { chunkSeq, tail } = rewriteTrail(flightId, trimmed);
-    state.chunkSeq = chunkSeq;
-    state.tail = tail;
-    state.pointCount = trimmed.length;
-    state.sessionBreaks = countSessionBreaks(trimmed);
-    return;
-  }
-
-  if (state.pointCount <= MAX_POINTS_PER_FLIGHT) return;
-
-  for (const c of listChunkSizesStmt.all(flightId)) {
-    if (state.pointCount - c.points < MAX_POINTS_PER_FLIGHT) break;
-    dropChunkStmt.run(flightId, c.seq);
-    state.pointCount -= c.points;
-  }
+  if (state.sessionBreaks < MAX_SESSIONS_PER_FLIGHT) return;
+  const trimmed = trimFlightSessions(assemblePath(flightId, { tail_blob: null }));
+  const { chunkSeq, tail } = rewriteTrail(flightId, trimmed);
+  state.chunkSeq = chunkSeq;
+  state.tail = tail;
+  state.pointCount = trimmed.length;
+  state.sessionBreaks = countSessionBreaks(trimmed);
 }
 
 const selectFlightStateStmt = db.prepare(
-  'SELECT path_json, tail_blob, last_point, point_count, session_breaks, chunk_seq FROM flight_history WHERE flightId = ?'
+  'SELECT path_json, tail_blob, last_point, point_count, session_breaks, chunk_seq, lastSeen FROM flight_history WHERE flightId = ?'
 );
 
 const upsertFlightStmt = db.prepare(`
@@ -665,6 +662,9 @@ const upsertFlightStmt = db.prepare(`
 
 const touchLastSeenStmt = db.prepare('UPDATE flight_history SET lastSeen = ? WHERE flightId = ?');
 
+// Saves land every 15 s per flight; a minute without one means polls were missed.
+const REAPPEAR_GAP_MS = 60 * 1000;
+
 /**
  * Optimized Batch Update
  *
@@ -688,6 +688,14 @@ function updateBatch(flights, sessionId = null) {
   const runBatch = db.transaction((flightList) => {
     for (const flight of flightList) {
       const row = selectFlightStateStmt.get(flight.flightId);
+
+      // Back after a gap (missed polls, a redeploy): the archivist may have
+      // taken it for finished and stored the trail so far. Reopen its claim so
+      // the whole flight is archived again when it really ends — the archive
+      // merges by timestamp, so the second upload completes the first.
+      if (row && row.lastSeen && now - row.lastSeen > REAPPEAR_GAP_MS) {
+        releaseFlightState(flight.flightId, 'archived');
+      }
 
       // A row written by the previous build still carries its trail as JSON.
       // Convert it here rather than waiting for the sweep — this flight is
@@ -741,11 +749,7 @@ function updateBatch(flights, sessionId = null) {
       // Session boundaries are spotted as they happen — the same test the old
       // full-array walk applied, just against the one point that can create a
       // new boundary instead of re-walking everything recorded so far.
-      if (state.lastPoint) {
-        const isTimeGap = (point.time - state.lastPoint.time) > SESSION_GAP_MS;
-        const isTeleport = getDistanceNM(state.lastPoint.lat, state.lastPoint.lon, point.lat, point.lon) > 50;
-        if (isTimeGap || isTeleport) state.sessionBreaks++;
-      }
+      if (state.lastPoint && isSessionBreak(state.lastPoint, point)) state.sessionBreaks++;
 
       state.tail.push(point);
       state.pointCount++;
@@ -915,6 +919,8 @@ module.exports = {
   claimFlightState,
   releaseFlightState,
   purgeOldData,
+  // Exposed for tests.
+  isSessionBreak,
   // Exposed for path_codec.test.cjs, which asserts against the stored shape
   // (chunk rows, hot-tail size) and not just the decoded trail.
   _db: db

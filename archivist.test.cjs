@@ -18,6 +18,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'archivist-test-'));
 process.env.DATA_DIR = TMP_DIR;
@@ -81,7 +82,8 @@ function stubUpload({ fail = false } = {}) {
   const calls = [];
   const original = global.fetch;
   global.fetch = async (url, opts) => {
-    calls.push({ url, body: JSON.parse(opts.body) });
+    assert.strictEqual(opts.headers['Content-Encoding'], 'gzip', 'uploads go gzipped');
+    calls.push({ url, body: JSON.parse(zlib.gunzipSync(opts.body)) });
     if (fail) return { ok: false, status: 503, statusText: 'Service Unavailable' };
     return { ok: true, status: 200, statusText: 'OK' };
   };
@@ -251,6 +253,63 @@ test('a sweep with nothing to do is silent and cheap', async () => {
   } finally {
     calls.restore();
   }
+});
+
+/* =========================
+ * Keeping the whole path
+ * ========================= */
+
+/** Cruise flight north along 70W: one point per 2-minute throttle step. */
+function cruisePoints(startMs, count, { gapAfter = new Set(), gapMs = 0, kt = 480 } = {}) {
+  const points = [];
+  let t = startMs;
+  let lat = 10;
+  for (let i = 0; i < count; i++) {
+    if (gapAfter.has(i)) t += gapMs;
+    const prev = points[points.length - 1];
+    if (prev) lat += (kt * ((t - prev.time) / 3600000)) / 60;
+    points.push({ lat, lon: -70, alt: 36000, gs: kt, time: t, hdg: 0 });
+    t += 2 * MINUTE;
+  }
+  return points;
+}
+
+test('missed polls in cruise do not cut the front off the trail', async () => {
+  const id = nextFlightId();
+  // Three 8-minute holes: each puts two honest cruise points ~80nm apart.
+  const pts = cruisePoints(Date.now() - 10 * 60 * MINUTE, 200, { gapAfter: new Set([50, 100, 150]), gapMs: 8 * MINUTE });
+  recordFlight(id, pts);
+  const stored = await history.getFlightPath(id);
+  assert.strictEqual(stored.length, pts.length, 'every point should still be there');
+  assert.strictEqual(stored[0].time, pts[0].time, 'the departure must survive');
+});
+
+test('a jump no aircraft could fly is still a new session', () => {
+  const a = { lat: 10, lon: -70, time: 0 };
+  assert.strictEqual(history.isSessionBreak(a, { lat: 15, lon: -70, time: 15000 }), true, '300nm in 15s');
+  assert.strictEqual(history.isSessionBreak(a, { lat: 11.5, lon: -70, time: 10 * MINUTE }), false, '90nm in 10min');
+  assert.strictEqual(history.isSessionBreak(a, { lat: 10, lon: -70, time: 31 * MINUTE }), true, '31min silence');
+});
+
+test('an archived flight is not handed back to every sweep', () => {
+  const id = nextFlightId();
+  const now = Date.now();
+  recordFlight(id, realFlight(now - 90 * MINUTE), now - 30 * MINUTE);
+  history.claimFlightState(id, 'archived');
+  const ids = archivist.findCandidates(now).map(r => r.flightId);
+  assert.ok(!ids.includes(id), 'a claimed flight would starve newer ones out of the batch');
+});
+
+test('a flight that comes back after a gap is archived again when it ends', () => {
+  const id = nextFlightId();
+  const now = Date.now();
+  const first = realFlight(now - 120 * MINUTE);
+  recordFlight(id, first, now - 40 * MINUTE);
+  assert.strictEqual(history.claimFlightState(id, 'archived'), true);
+  // It reappears: the next poll must reopen the claim.
+  const last = first[first.length - 1];
+  recordFlight(id, [{ ...last, lat: last.lat + 0.01, time: now }]);
+  assert.strictEqual(history.claimFlightState(id, 'archived'), true, 'claim should have been released');
 });
 
 /* =========================
