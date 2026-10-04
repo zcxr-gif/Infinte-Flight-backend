@@ -18,6 +18,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'archivist-test-'));
 process.env.DATA_DIR = TMP_DIR;
@@ -81,7 +82,8 @@ function stubUpload({ fail = false } = {}) {
   const calls = [];
   const original = global.fetch;
   global.fetch = async (url, opts) => {
-    calls.push({ url, body: JSON.parse(opts.body) });
+    assert.strictEqual(opts.headers['Content-Encoding'], 'gzip', 'uploads go gzipped');
+    calls.push({ url, body: JSON.parse(zlib.gunzipSync(opts.body)) });
     if (fail) return { ok: false, status: 503, statusText: 'Service Unavailable' };
     return { ok: true, status: 200, statusText: 'OK' };
   };

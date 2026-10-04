@@ -48,6 +48,17 @@
  *   blob  := chunk*
  *   chunk := magic u8 | version u8 | varint count | absolute point | delta*
  *
+ * Version 2 (what is written now) stores lat, lon, alt and time as the change
+ * in their delta — a second difference — and gs and hdg as plain deltas. An
+ * aircraft holding course, speed and climb rate moves by nearly the same step
+ * every sample, so the second difference sits near zero and fits in one byte
+ * where the step itself needed two or three: a cruise sample 2 minutes on is
+ * a ~120000 ms time delta (3 bytes) but a few hundred ms of jitter (2), and a
+ * ~2500-unit longitude step (2 bytes) but a near-zero change (1). That is
+ * roughly 30% off a typical trail. Decoding is the same varint walk plus one
+ * addition per field, so unlike deflate it costs reads nothing. Version 1
+ * chunks still decode, so blobs already on disk need no migration.
+ *
  * Each chunk restarts from an absolute point, which is the property that makes
  * appending cheap: sealing new points onto a trail is a Buffer.concat of the
  * existing blob and a freshly encoded chunk. The existing blob is never
@@ -71,7 +82,9 @@
 'use strict';
 
 const CHUNK_MAGIC = 0xb1;
-const CHUNK_VERSION = 1;
+const CHUNK_VERSION_DELTA = 1;   // first differences — still read, no longer written
+const CHUNK_VERSION_DELTA2 = 2;  // second differences for lat, lon, alt, time
+const CHUNK_VERSION = CHUNK_VERSION_DELTA2;
 
 /* ---------- varints ----------
  * Arithmetic rather than bit-shifts throughout: timestamps are ~1.7e12 and
@@ -147,7 +160,10 @@ function encodeChunk(points) {
   let time = Math.floor(Number(first.time) || 0);
   let hdg = wrapHeading(toInt(first.hdg));
 
-  // The opening point of a chunk is absolute; everything after is a delta.
+  // The opening point of a chunk is absolute; everything after is a delta, and
+  // for lat/lon/alt/time the change in that delta. The steps start at zero, so
+  // the second point's "second difference" is just its delta.
+  let dLat = 0, dLon = 0, dAlt = 0, dTime = 0;
   writeSignedVarint(out, lat);
   writeSignedVarint(out, lon);
   writeSignedVarint(out, alt);
@@ -164,18 +180,21 @@ function encodeChunk(points) {
     const nTime = Math.floor(Number(p.time) || 0);
     const nHdg = wrapHeading(toInt(p.hdg));
 
-    writeSignedVarint(out, nLat - lat);
-    writeSignedVarint(out, nLon - lon);
-    writeSignedVarint(out, nAlt - alt);
-    writeSignedVarint(out, nGs - gs);
     // Time only ever advances — shouldSkipPoint() drops any report that
-    // doesn't — so this stays an unsigned varint. Guard anyway rather than
-    // encode a negative as a huge unsigned value.
-    writeVarint(out, Math.max(0, nTime - time));
+    // doesn't. Clamp anyway so a bad input cannot run the trail backwards.
+    const sLat = nLat - lat, sLon = nLon - lon, sAlt = nAlt - alt;
+    const sTime = Math.max(0, nTime - time);
+
+    writeSignedVarint(out, sLat - dLat);
+    writeSignedVarint(out, sLon - dLon);
+    writeSignedVarint(out, sAlt - dAlt);
+    writeSignedVarint(out, nGs - gs);
+    writeSignedVarint(out, sTime - dTime);
     writeSignedVarint(out, foldHeading(nHdg - hdg));
 
+    dLat = sLat; dLon = sLon; dAlt = sAlt; dTime = sTime;
     lat = nLat; lon = nLon; alt = nAlt; gs = nGs; hdg = nHdg;
-    time = Math.max(time, nTime);
+    time += sTime;
   }
 
   return Buffer.from(out);
@@ -200,7 +219,8 @@ function decodeBlob(buf) {
     while (state.i < buf.length) {
       if (buf[state.i] !== CHUNK_MAGIC) break;
       const version = buf[state.i + 1];
-      if (version !== CHUNK_VERSION) break;
+      if (version !== CHUNK_VERSION_DELTA && version !== CHUNK_VERSION_DELTA2) break;
+      const second = version === CHUNK_VERSION_DELTA2;
       state.i += 2;
 
       const count = readVarint(buf, state);
@@ -215,12 +235,21 @@ function decodeBlob(buf) {
 
       points.push({ lat: fromFixed4(lat), lon: fromFixed4(lon), alt, gs, time, hdg });
 
+      let dLat = 0, dLon = 0, dAlt = 0, dTime = 0;
       for (let n = 1; n < count; n++) {
-        lat += readSignedVarint(buf, state);
-        lon += readSignedVarint(buf, state);
-        alt += readSignedVarint(buf, state);
-        gs += readSignedVarint(buf, state);
-        time += readVarint(buf, state);
+        if (second) {
+          dLat += readSignedVarint(buf, state); lat += dLat;
+          dLon += readSignedVarint(buf, state); lon += dLon;
+          dAlt += readSignedVarint(buf, state); alt += dAlt;
+          gs += readSignedVarint(buf, state);
+          dTime += readSignedVarint(buf, state); time += dTime;
+        } else {
+          lat += readSignedVarint(buf, state);
+          lon += readSignedVarint(buf, state);
+          alt += readSignedVarint(buf, state);
+          gs += readSignedVarint(buf, state);
+          time += readVarint(buf, state);
+        }
         hdg = wrapHeading(hdg + readSignedVarint(buf, state));
 
         points.push({ lat: fromFixed4(lat), lon: fromFixed4(lon), alt, gs, time, hdg });
@@ -253,6 +282,8 @@ module.exports = {
   appendChunk,
   CHUNK_MAGIC,
   CHUNK_VERSION,
+  CHUNK_VERSION_DELTA,
+  CHUNK_VERSION_DELTA2,
   // Exported for tests.
   _internals: { writeVarint, readVarint, zigzag, unzigzag, foldHeading, wrapHeading }
 };

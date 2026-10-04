@@ -209,6 +209,69 @@ test('costs under 11 bytes per point, at least 4x smaller than the JSON it repla
   assert.ok(ratio > 4, `expected at least 4x smaller, got ${ratio.toFixed(2)}x`);
 });
 
+/** Encodes a chunk the way version 1 did, so old blobs on disk can be stood in for. */
+function encodeV1(points) {
+  const { writeVarint, zigzag, foldHeading, wrapHeading } = codec._internals;
+  const sv = (out, n) => writeVarint(out, zigzag(Math.round(n)));
+  const q = (p) => ({
+    lat: Math.round(p.lat * 10000), lon: Math.round(p.lon * 10000), alt: Math.round(p.alt),
+    gs: Math.round(p.gs), time: Math.floor(p.time), hdg: wrapHeading(Math.round(p.hdg))
+  });
+  const out = [codec.CHUNK_MAGIC, codec.CHUNK_VERSION_DELTA];
+  writeVarint(out, points.length);
+  let prev = q(points[0]);
+  sv(out, prev.lat); sv(out, prev.lon); sv(out, prev.alt); sv(out, prev.gs);
+  writeVarint(out, prev.time); writeVarint(out, prev.hdg);
+  for (const p of points.slice(1)) {
+    const c = q(p);
+    sv(out, c.lat - prev.lat); sv(out, c.lon - prev.lon); sv(out, c.alt - prev.alt); sv(out, c.gs - prev.gs);
+    writeVarint(out, c.time - prev.time); sv(out, foldHeading(c.hdg - prev.hdg));
+    prev = c;
+  }
+  return Buffer.from(out);
+}
+
+test('new chunks are written as version 2', () => {
+  const blob = codec.encodeAll(syntheticFlight().slice(0, 10));
+  assert.strictEqual(blob[1], codec.CHUNK_VERSION_DELTA2);
+});
+
+test('version 1 chunks already on disk still decode exactly', () => {
+  const flight = syntheticFlight().slice(0, 48);
+  assertSameTrail(codec.decodeBlob(encodeV1(flight)), flight, 'v1');
+});
+
+test('a trail sealed partly before the upgrade decodes across both versions', () => {
+  const flight = syntheticFlight().slice(0, 96);
+  const mixed = Buffer.concat([encodeV1(flight.slice(0, 48)), codec.encodeChunk(flight.slice(48))]);
+  assertSameTrail(codec.decodeBlob(mixed), flight, 'v1+v2');
+});
+
+test('version 2 is at least 20% smaller than version 1', () => {
+  const flight = syntheticFlight();
+  let v1 = 0, v2 = 0;
+  for (let i = 0; i < flight.length; i += 48) {
+    const slice = flight.slice(i, i + 48);
+    v1 += encodeV1(slice).length;
+    v2 += codec.encodeChunk(slice).length;
+  }
+  console.log(`      v1 ${(v1 / flight.length).toFixed(1)}B/pt -> v2 ${(v2 / flight.length).toFixed(1)}B/pt`);
+  assert.ok(v2 <= v1 * 0.8, `v1 ${v1}B, v2 ${v2}B`);
+});
+
+test('second differences survive extreme steps without drift', () => {
+  // Teleport, standstill, a heading wrap and a huge time gap, back to back.
+  const t = 1712345678901;
+  const flight = [
+    { lat: -89.9999, lon: -179.9999, alt: 0, gs: 0, time: t, hdg: 359 },
+    { lat: 89.9999, lon: 179.9999, alt: 60000, gs: 2000, time: t + 1, hdg: 0 },
+    { lat: 89.9999, lon: 179.9999, alt: 60000, gs: 2000, time: t + 2, hdg: 1 },
+    { lat: 0, lon: 0, alt: -500, gs: 0, time: t + 86400000, hdg: 180 },
+    { lat: 0.0001, lon: -0.0001, alt: -499, gs: 1, time: t + 86400001, hdg: 179 }
+  ];
+  assertSameTrail(codec.decodeBlob(codec.encodeAll(flight)), flight, 'extremes');
+});
+
 /* =========================
  * Storage
  * ========================= */

@@ -41,7 +41,11 @@
 
 'use strict';
 
+const { promisify } = require('util');
+const zlib = require('zlib');
 const history = require('./history.cjs');
+
+const gzip = promisify(zlib.gzip);
 
 const intEnv = (name, dflt) => {
   const parsed = parseInt(process.env[name] ?? '', 10);
@@ -138,21 +142,26 @@ function findCandidates(now = Date.now()) {
 const UPLOAD_TIMEOUT_MS = intEnv('ARCHIVE_UPLOAD_TIMEOUT_MS', 30000);
 
 async function uploadTrail(row, path) {
+  // Sent gzipped: trail JSON repeats the same six keys on every point, so this
+  // is ~5x fewer bytes on the wire and in the receiver's request buffer. The
+  // archive's express.json() inflates it transparently, and its size limit
+  // applies to the inflated body.
+  const body = await gzip(JSON.stringify({
+    userId: row.userId,
+    flightId: row.flightId,
+    // The stored file stays a bare array of points, which is what
+    // replayBrowser.js feeds straight into the replay engine. Anything richer
+    // would have to go beside the file, not inside it.
+    trail: path
+  }));
   const res = await fetch(`${ARCHIVE_BACKEND_URL}/api/trails`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
     // A hung request would otherwise hold the sweep open indefinitely, and with
     // it the trail it is carrying. Timing out releases the claim and retries on
     // the next pass, which is what should happen anyway.
     signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
-    body: JSON.stringify({
-      userId: row.userId,
-      flightId: row.flightId,
-      // The stored file stays a bare array of points, which is what
-      // replayBrowser.js feeds straight into the replay engine. Anything richer
-      // would have to go beside the file, not inside it.
-      trail: path
-    })
+    body
   });
 
   if (!res.ok) {
