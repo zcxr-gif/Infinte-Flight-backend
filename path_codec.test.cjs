@@ -333,25 +333,27 @@ test('stationary, stale and cruise-throttled reports are still skipped', async (
   assert.strictEqual(stored.length, 2, `expected 2 recorded points, got ${stored.length}`);
 });
 
-test('an over-long trail is trimmed from the front, keeping the most recent flying', async () => {
+test('an over-long trail is thinned, keeping its departure and the most recent flying', async () => {
   const id = nextFlightId();
-  // 1600 accepted points — past MAX_POINTS_PER_FLIGHT (1500).
+  const max = history.MAX_POINTS_PER_FLIGHT;
+  // Past the ceiling, below the cruise throttle so every poll is a point.
   let t = 1712345678901;
   const flight = [];
-  for (let i = 0; i < 1600; i++) {
+  for (let i = 0; i < max + 400; i++) {
     flight.push({ lat: 40 + i * 0.001, lon: -70 + i * 0.001, alt: 5000, gs: 300, time: t, hdg: 90 });
     t += 15000;
   }
   for (const p of flight) poll(id, p);
 
   const stored = await history.getFlightPath(id);
-  // Trimming works at chunk granularity and only drops a chunk when the trail
-  // stays above the limit without it, so the kept length settles between
-  // MAX_POINTS_PER_FLIGHT and that plus a chunk's worth of slack.
-  assert.ok(stored.length < 1600, `expected trimming below the 1600 polled, got ${stored.length}`);
-  assert.ok(stored.length >= 1500, `expected at least MAX_POINTS_PER_FLIGHT kept, got ${stored.length}`);
-  // The front is what gets dropped — the newest point must survive.
+  // Limits apply at seal time, so the kept length can run a chunk over.
+  assert.ok(stored.length <= max, `expected thinning to at most ${max}, got ${stored.length}`);
+  // Cutting the front off is what lost the start of long flights.
+  assert.strictEqual(stored[0].time, flight[0].time, 'the departure must survive');
   assert.strictEqual(stored[stored.length - 1].time, flight[flight.length - 1].time);
+  // The recent stretch behind the live marker keeps full resolution.
+  const tailTimes = stored.slice(-48).map(p => p.time);
+  assert.deepStrictEqual(tailTimes, flight.slice(-48).map(p => p.time));
 });
 
 test('a legacy path_json row is migrated on its next poll without losing points', async () => {

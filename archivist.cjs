@@ -113,17 +113,26 @@ function isWorthArchiving(path) {
  *
  * Ordered oldest first so a backlog drains in the order it built up, and
  * bounded so one sweep can never take an unbounded slice of the table.
+ *
+ * Flights already claimed are excluded here, not just skipped by the claim in
+ * the loop. Without that, the same oldest BATCH rows — all long since archived
+ * — came back on every sweep until they aged out of the window, so the sweep
+ * never reached newer flights: replays turned up a day late, and on a busy day
+ * flights slid out of the window without ever being archived.
  */
+const selectCandidatesStmt = history._db.prepare(`
+  SELECT fh.flightId, fh.userId, fh.callsign, fh.aircraftName, fh.liveryName, fh.lastSeen
+  FROM flight_history fh
+  WHERE fh.lastSeen < ? AND fh.lastSeen >= ?
+    AND NOT EXISTS (
+      SELECT 1 FROM va_sent_events e WHERE e.flightId = fh.flightId AND e.event = 'archived'
+    )
+  ORDER BY fh.lastSeen ASC
+  LIMIT ?
+`);
+
 function findCandidates(now = Date.now()) {
-  return history._db
-    .prepare(`
-      SELECT flightId, userId, callsign, aircraftName, liveryName, lastSeen
-      FROM flight_history
-      WHERE lastSeen < ? AND lastSeen >= ?
-      ORDER BY lastSeen ASC
-      LIMIT ?
-    `)
-    .all(now - GRACE_MS, now - EFFECTIVE_MAX_AGE_MS, BATCH);
+  return selectCandidatesStmt.all(now - GRACE_MS, now - EFFECTIVE_MAX_AGE_MS, BATCH);
 }
 
 const UPLOAD_TIMEOUT_MS = intEnv('ARCHIVE_UPLOAD_TIMEOUT_MS', 30000);
