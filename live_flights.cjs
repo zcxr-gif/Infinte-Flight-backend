@@ -26,6 +26,7 @@ const pushNotifications = require('./push.cjs');
 const vaFilter = require('./va_filter.cjs');
 const flightDelta = require('./flight_delta.cjs');
 const discordPresence = require('./discord_presence.cjs');
+const { installRateGate, POLL: IF_POLL } = require('./if_rate_gate.cjs');
 
 // ⬇️ 1. IMPORT HTTP & SOCKET.IO
 const { createServer } = require('http');
@@ -360,31 +361,15 @@ const ifClient = axios.create({
 // the dashboard Diagnostics tab can surface what's slow / where it's choking.
 metrics.instrumentAxios(ifClient);
 /* =========================
- * Axios 429 Interceptor (Exponential Backoff)
- * ========================= */
-ifClient.interceptors.response.use(
-  response => response,
-  async (error) => {
-    const config = error.config;
-    if (error?.response?.status === 429) {
-      config._retryCount = (config._retryCount || 0) + 1;
-      const MAX_RETRIES = 4;
-      if (config._retryCount <= MAX_RETRIES) {
-        // Respect Retry-After header if provided, otherwise exponential backoff
-        const retryAfterHeader = error.response.headers?.['retry-after'];
-        
-        const retryAfterMs = retryAfterHeader
-          ? parseFloat(retryAfterHeader) * 1000
-          : Math.min(1000 * Math.pow(2, config._retryCount), 32000);
-        console.warn(`[if-api] ⏳ 429 Too Many Requests. Retry ${config._retryCount}/${MAX_RETRIES} in ${Math.round(retryAfterMs / 1000)}s.`);
-        await new Promise(r => setTimeout(r, retryAfterMs));
-        return ifClient(config);
-      }
-      console.error(`[if-api] 🛑 429 persisted after ${MAX_RETRIES} retries. Giving up.`);
-    }
-    return Promise.reject(error);
-  }
-);
+ * Rate gate (see if_rate_gate.cjs)
+ * =========================
+ * Registered after the metrics hook so it runs first (axios runs request
+ * interceptors last-in, first-out): time spent waiting out a cooldown is not
+ * counted as API latency. A request the gate refuses shows on the dashboard
+ * as a 429 taking 0 ms — it was never sent.
+ */
+const ifRateGate = installRateGate(ifClient);
+const POLL_REQUEST = { ifPriority: IF_POLL };
 
 /* =========================
  * Concurrency Limiter (for batch requests)
@@ -1149,7 +1134,7 @@ async function getSessions() {
   }
   
   console.log('[getSessions] Fetching fresh sessions from API.');
-  const { data } = await ifClient.get('/sessions');
+  const { data } = await ifClient.get('/sessions', POLL_REQUEST);
   const items = unwrap(data);
   const sessions = items.map((s) => ({
     id: s?.id || s?.uuid || null,
@@ -1186,7 +1171,7 @@ function pickSessionIdByName(sessions, desiredName = 'Expert Server') {
 async function getFlightsForSession(sessionId) {
   if (!sessionId) throw new Error('Missing sessionId');
   try {
-    const { data } = await ifClient.get(`/sessions/${encodeURIComponent(sessionId)}/flights`);
+    const { data } = await ifClient.get(`/sessions/${encodeURIComponent(sessionId)}/flights`, POLL_REQUEST);
     const payload = data && typeof data === 'object' ? data : {};
     if (typeof payload.errorCode === 'number' && payload.errorCode !== 0) {
       const err = new Error(`IF API errorCode ${payload.errorCode}`);
@@ -1200,7 +1185,7 @@ async function getFlightsForSession(sessionId) {
     if (status === 401 || status === 403 || status === 404) {
       const { data: retry } = await ifClient.get(
         `/sessions/${encodeURIComponent(sessionId)}/flights`,
-        { params: { apikey: IF_API_KEY } }
+        { ...POLL_REQUEST, params: { apikey: IF_API_KEY } }
       );
       const payload = retry && typeof retry === 'object' ? retry : {};
       if (typeof payload.errorCode === 'number' && payload.errorCode !== 0) {
@@ -1891,7 +1876,7 @@ async function pollAndBroadcastFlights() {
     sessions = await getSessions();
   } catch (e) {
     console.warn('[broadcast] Sessions fetch failed', e?.message);
-    if (e?.message?.includes('429')) nextBroadcastPollMs = 60000;
+    if (e?.response?.status === 429) nextBroadcastPollMs = ifRateGate.remainingMs();
     return;
   }
 
@@ -2038,8 +2023,8 @@ async function pollAndBroadcastFlights() {
 
     } catch (e) {
       console.warn(`[broadcast] Flights fetch failed for "${serverName}"`, e?.message);
-      if (e?.message?.includes('429')) {
-         nextBroadcastPollMs = 60000;
+      if (e?.response?.status === 429) {
+         nextBroadcastPollMs = ifRateGate.remainingMs();
       }
     }
   }
@@ -2082,9 +2067,8 @@ async function pollAndBroadcastFlights() {
   pollAndBroadcastFlights()
     .catch(e => {
         console.error('[broadcast] Unhandled poll error', e?.message);
-         if (e?.message?.includes('429')) {
-            console.error(`[broadcast] 🛑 Unhandled 429. Backing off for 60s.`);
-            nextBroadcastPollMs = 60000; 
+         if (e?.response?.status === 429) {
+            nextBroadcastPollMs = ifRateGate.remainingMs();
          }
     })
    
@@ -2096,7 +2080,8 @@ async function pollAndBroadcastFlights() {
       
       let timeToWait;
 
-      // 3. Check if a major backoff (like 60s from a 429 error) was triggered
+      // 3. A 429 cooldown longer than the normal interval: wait it out (and no
+      //    longer — every extra second is a position not recorded).
       if (nextBroadcastPollMs > targetInterval) {
       
         timeToWait = nextBroadcastPollMs;
