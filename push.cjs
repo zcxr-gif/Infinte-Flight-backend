@@ -18,7 +18,8 @@
  * holder who also has the native app installed gets one push, not two.
  *
  * Env:
- *   APNS_KEY_P8     contents of the .p8 auth key (literal "\n" allowed)
+ *   APNS_KEY_P8     contents of the .p8 auth key (literal "\n", flattened
+ *                   newlines, quotes or base64 of the file all accepted)
  *   APNS_KEY_PATH   alternative: path to the .p8 file
  *   APNS_KEY_ID     key id of the .p8
  *   APNS_TEAM_ID    Apple developer team id
@@ -57,6 +58,7 @@ const Database = require('better-sqlite3');
 
 const supabase = require('./supabase.cjs');
 const geo = require('./geo.cjs');
+const { parsePrivateKey } = require('./apns_key.cjs');
 
 const APNS_PRODUCTION_HOST = 'https://api.push.apple.com';
 const APNS_SANDBOX_HOST = 'https://api.sandbox.push.apple.com';
@@ -78,19 +80,32 @@ const LIVE_ACTIVITY_TOPIC = `${APNS_TOPIC}.push-type.liveactivity`;
 const KEY_ID = (process.env.APNS_KEY_ID || '').trim();
 const TEAM_ID = (process.env.APNS_TEAM_ID || '').trim();
 
-let PRIVATE_KEY_PEM = process.env.APNS_KEY_P8 || '';
-if (!PRIVATE_KEY_PEM && process.env.APNS_KEY_PATH) {
+let rawKey = process.env.APNS_KEY_P8 || '';
+if (!rawKey && process.env.APNS_KEY_PATH) {
   try {
-    PRIVATE_KEY_PEM = fs.readFileSync(process.env.APNS_KEY_PATH.trim(), 'utf8');
+    rawKey = fs.readFileSync(process.env.APNS_KEY_PATH.trim(), 'utf8');
   } catch (e) {
     console.error('[push] ❌ Could not read APNS_KEY_PATH:', e.message);
   }
 }
-// Allow the key to be pasted into an env var with literal "\n" sequences.
-PRIVATE_KEY_PEM = PRIVATE_KEY_PEM.replace(/\\n/g, '\n').trim();
+
+// Parsed once, here. Mangled pastes (flattened newlines, quotes, body only,
+// base64 of the whole file) are repaired by apns_key.cjs; a key that is still
+// unusable disables push with one clear line instead of failing every send.
+let PRIVATE_KEY = null;
+let KEY_ERROR = null;
+if (rawKey.trim()) {
+  ({ key: PRIVATE_KEY, error: KEY_ERROR } = parsePrivateKey(rawKey));
+  if (KEY_ERROR) {
+    console.error(
+      `[push] ❌ APNs key is unusable (${KEY_ERROR}) — push is DISABLED. ` +
+        'Set APNS_KEY_P8 to the full contents of the .p8 file, BEGIN/END lines included.'
+    );
+  }
+}
 
 function configured() {
-  return !!(KEY_ID && TEAM_ID && PRIVATE_KEY_PEM);
+  return !!(KEY_ID && TEAM_ID && PRIVATE_KEY);
 }
 
 /* =========================
@@ -272,7 +287,7 @@ function providerToken() {
   const signingInput = `${header}.${payload}`;
   const signature = crypto
     .sign('sha256', Buffer.from(signingInput), {
-      key: crypto.createPrivateKey(PRIVATE_KEY_PEM),
+      key: PRIVATE_KEY,
       dsaEncoding: 'ieee-p1363',
     })
     .toString('base64url');
@@ -1075,6 +1090,7 @@ async function pushLiveActivityUpdates(flightById) {
 function stats() {
   const out = {
     configured: configured(),
+    keyError: KEY_ERROR,
     host: APNS_HOST,
     environmentFallback: envFallbackEnabled(),
     devices: 0,

@@ -168,3 +168,18 @@ these writes touches — `latitude`, `longitude`, `altitude_msl`, `heading`,
   **not** turn into a retry storm — the refresh clock is stamped whether or not
   the fetch worked, so a failure costs a minute of staleness rather than a
   request every three seconds.
+- **`[history] ⚠️ Resetting flight history (one-time reset 2026-10-04-malformed)`**
+  is expected exactly once, on the first boot of this build: it clears the
+  corrupted `flight_history.db`. Already-archived replays are unaffected.
+- **`[history] ❌ Database is corrupt — requesting a reset and restarting`**
+  means a write hit `SQLITE_CORRUPT`. The process exits with code 1 and the next
+  boot starts a fresh history file, so the platform's restart policy must be on
+  (restart on failure). If it is followed by `Corruption again right after a
+  reset`, the volume itself is suspect.
+- **Run one instance per volume.** Two processes sharing `DATA_DIR` (an
+  overlapping rolling deploy, or more than one replica) is a classic way to
+  corrupt SQLite. Use a stop-then-start deploy strategy (`Recreate` on
+  Kubernetes).
+- **`[push] ❌ APNs key is unusable`** means push is disabled until
+  `APNS_KEY_P8` holds the real `.p8` contents; `push.keyError` on
+  `/api/admin/diagnostics` says why.
