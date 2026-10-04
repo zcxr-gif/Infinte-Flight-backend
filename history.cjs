@@ -41,16 +41,12 @@ const RETENTION_MS = RETENTION_HOURS * 60 * 60 * 1000;
 const MAX_DB_BYTES = intEnv('HISTORY_MAX_DB_MB', 4096) * 1024 * 1024;
 
 /* --- Points per flight ---
- * A ceiling on one trail, not a window onto its newest part. When a flight
- * outgrows it, the older part of the trail is thinned (see thinTrail) so the
- * whole route survives at lower resolution. Dropping the oldest points instead
- * — what this used to do — cut the departure off any long flight flown below
- * the cruise throttle, which is exactly the "only part of my path was saved"
- * report. Binary chunks cost a few bytes a point, so 3000 is cheap.
+ * There is no cap. Every point the recorder accepts is kept for the life of the
+ * flight. A cap used to drop the oldest points once a trail passed 1500, which
+ * cut the departure off any long flight flown below the cruise throttle. The
+ * throttling in shouldSkipPoint already bounds a trail: a 15-hour flight is a
+ * couple of thousand points, a few bytes each once chunked.
  */
-const MAX_POINTS_PER_FLIGHT = Math.max(200, intEnv('HISTORY_MAX_POINTS', 3000));
-// Thinning aims below the ceiling so it runs once per many chunks, not on every seal.
-const THIN_TARGET_POINTS = Math.floor(MAX_POINTS_PER_FLIGHT * 0.75);
 
 /* --- Chunking ---
  * Points accumulate in a small hot tail on the flight's own row, which is the
@@ -477,28 +473,6 @@ function isSessionBreak(p1, p2, sessionGapMs = SESSION_GAP_MS) {
 }
 
 /**
- * Brings a trail down to `target` points without losing any of the route.
- *
- * The newest RECENT_FULL_RES points are kept as recorded — that is the part
- * drawn behind the live marker, where detail shows. Everything older loses
- * every other point, repeatedly, until the trail fits. The first point and
- * the last point before the recent stretch always survive, so the departure
- * and the join stay where they were.
- */
-const RECENT_FULL_RES = CHUNK_POINTS * 4;
-function thinTrail(points, target = THIN_TARGET_POINTS) {
-  if (points.length <= target) return points;
-  const keepRecent = Math.min(RECENT_FULL_RES, Math.max(0, target - 2));
-  const recent = points.slice(points.length - keepRecent);
-  let older = points.slice(0, points.length - keepRecent);
-  while (older.length > 2 && older.length + recent.length > target) {
-    const last = older.length - 1;
-    older = older.filter((_, i) => i % 2 === 0 || i === last);
-  }
-  return older.concat(recent);
-}
-
-/**
  * Keeps only the last N flight sessions within the path array.
  */
 function trimFlightSessions(pathArray, maxSessions = MAX_SESSIONS_PER_FLIGHT, sessionGapMs = SESSION_GAP_MS) {
@@ -516,10 +490,6 @@ function trimFlightSessions(pathArray, maxSessions = MAX_SESSIONS_PER_FLIGHT, se
     const sessionsToRemove = sessionBoundaries.length - maxSessions + 1;
     const sliceIndex = sessionBoundaries[sessionsToRemove - 1];
     pathArray = pathArray.slice(sliceIndex);
-  }
-
-  if (pathArray.length > MAX_POINTS_PER_FLIGHT) {
-    return thinTrail(pathArray);
   }
 
   return pathArray;
@@ -648,38 +618,20 @@ function countSessionBreaks(pathArray) {
 }
 
 /**
- * Applies the size and session limits to a flight that has just sealed a chunk.
+ * Applies the session limit to a flight that has just sealed a chunk.
  *
- * Both cases decode, trim and rewrite the trail. A trail over the point
- * ceiling is thinned down to THIN_TARGET_POINTS rather than having chunks cut
- * off its front, so the departure is never lost; aiming a quarter below the
- * ceiling means that rewrite comes round once every dozen-plus seals of a very
- * long flight, never on an ordinary poll. Trimming sessions needs three
- * genuine breaks (see isSessionBreak) under one flightId to trigger at all.
- *
- * Limits are enforced at chunk granularity: a trail can run up to
- * CHUNK_POINTS over MAX_POINTS_PER_FLIGHT before the next seal pulls it back.
- * That slack is the entire point — it is what keeps the common poll O(1).
+ * Only a flight with more genuine sessions (see isSessionBreak) logged under
+ * one flightId than we keep pays the decode-trim-rewrite; every other seal is a
+ * single counter check, which is what keeps the common poll O(1).
  */
 function enforceTrailLimits(flightId, state) {
-  if (state.sessionBreaks >= MAX_SESSIONS_PER_FLIGHT) {
-    const trimmed = trimFlightSessions(assemblePath(flightId, { tail_blob: null }));
-    const { chunkSeq, tail } = rewriteTrail(flightId, trimmed);
-    state.chunkSeq = chunkSeq;
-    state.tail = tail;
-    state.pointCount = trimmed.length;
-    state.sessionBreaks = countSessionBreaks(trimmed);
-    return;
-  }
-
-  if (state.pointCount <= MAX_POINTS_PER_FLIGHT) return;
-
-  // Called straight after a seal, so the tail is empty and the chunks hold it all.
-  const thinned = thinTrail(assemblePath(flightId, { tail_blob: null }));
-  const { chunkSeq, tail } = rewriteTrail(flightId, thinned);
+  if (state.sessionBreaks < MAX_SESSIONS_PER_FLIGHT) return;
+  const trimmed = trimFlightSessions(assemblePath(flightId, { tail_blob: null }));
+  const { chunkSeq, tail } = rewriteTrail(flightId, trimmed);
   state.chunkSeq = chunkSeq;
   state.tail = tail;
-  state.pointCount = thinned.length;
+  state.pointCount = trimmed.length;
+  state.sessionBreaks = countSessionBreaks(trimmed);
 }
 
 const selectFlightStateStmt = db.prepare(
@@ -969,8 +921,6 @@ module.exports = {
   purgeOldData,
   // Exposed for tests.
   isSessionBreak,
-  thinTrail,
-  MAX_POINTS_PER_FLIGHT,
   // Exposed for path_codec.test.cjs, which asserts against the stored shape
   // (chunk rows, hot-tail size) and not just the decoded trail.
   _db: db
