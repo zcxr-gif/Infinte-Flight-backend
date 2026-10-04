@@ -75,15 +75,115 @@ if (!fs.existsSync(DATA_DIR)) {
 
 console.log(`[history] Database path: ${DB_PATH}`);
 
+/* --- Corruption recovery ---
+ * This database is a rolling cache: finished flights are promoted to the
+ * replay archive (archivist.cjs), and everything else ages out within the
+ * retention window anyway. So when the file is corrupt, the right move is to
+ * start it again — not to limp on with every write failing, which is what
+ * happened in October 2026: `database disk image is malformed` on every poll,
+ * no trails recorded, no flights archived, and nothing to say so but a log line.
+ *
+ * Three ways the file gets reset, all before anything is prepared against it:
+ *
+ *   - ONE_TIME_RESET differs from the tag stored beside the database. Bump it to
+ *     wipe the history once on the next deploy; it never fires twice for the
+ *     same tag. The marker is written before the delete, so a volume that
+ *     cannot hold the marker never has its database deleted on every boot.
+ *   - A reset was requested: a write hit SQLITE_CORRUPT at runtime (see
+ *     noteDbError), which leaves a request file and restarts the process.
+ *   - The file cannot even be opened and read as a database.
+ */
+const ONE_TIME_RESET = '2026-10-04-malformed';
+const RESET_DONE_PATH = DB_PATH + '.reset-done';
+const RESET_REQUEST_PATH = DB_PATH + '.reset-requested';
+
+const isCorruptionError = (e) => /^SQLITE_(CORRUPT|NOTADB)/.test(String(e?.code || ''));
+
+function deleteDatabaseFiles(reason) {
+  console.error(`[history] ⚠️ Resetting flight history (${reason}) — deleting ${DB_PATH}`);
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.rmSync(DB_PATH + suffix, { force: true }); } catch (e) {
+      console.error(`[history] ❌ Could not delete ${DB_PATH + suffix}:`, e.message);
+    }
+  }
+}
+
+// Set when this boot started from a freshly reset file, so a corruption error
+// straight afterwards (a failing disk, say) cannot become a restart loop.
+let resetThisBoot = false;
+
+function readTag(file) {
+  try { return fs.readFileSync(file, 'utf8').trim(); } catch { return null; }
+}
+
+if (readTag(RESET_DONE_PATH) !== ONE_TIME_RESET) {
+  let marked = false;
+  try { fs.writeFileSync(RESET_DONE_PATH, ONE_TIME_RESET + '\n'); marked = true; } catch (e) {
+    console.error('[history] ❌ Could not record the one-time reset, skipping it:', e.message);
+  }
+  if (marked && fs.existsSync(DB_PATH)) {
+    deleteDatabaseFiles(`one-time reset ${ONE_TIME_RESET}`);
+    resetThisBoot = true;
+  }
+}
+
+if (fs.existsSync(RESET_REQUEST_PATH)) {
+  deleteDatabaseFiles(`requested: ${readTag(RESET_REQUEST_PATH) || 'corruption detected'}`);
+  try { fs.rmSync(RESET_REQUEST_PATH, { force: true }); } catch { /* retried next boot */ }
+  resetThisBoot = true;
+}
+
+// Opening succeeds on most corrupt files; reading the schema is what fails, so
+// do that here, while a fresh start is still free.
+function openDatabase() {
+  const handle = new Database(DB_PATH);
+  handle.pragma('journal_mode = WAL');
+  handle.prepare('SELECT COUNT(*) FROM sqlite_master').get();
+  return handle;
+}
+
 // 1. Initialize the DB
 let db;
 try {
-  db = new Database(DB_PATH);
+  try {
+    db = openDatabase();
+  } catch (e) {
+    if (!isCorruptionError(e)) throw e;
+    deleteDatabaseFiles(`unreadable at startup: ${e.message}`);
+    resetThisBoot = true;
+    db = openDatabase();
+  }
 } catch (e) {
   console.error('[history] ❌ CRITICAL DATABASE ERROR:', e.message);
   console.warn('[history] Falling back to in-memory database (Data will not persist!)');
   db = new Database(':memory:');
 }
+
+/**
+ * Called with any error a write to this database throws. On corruption it asks
+ * for a reset and exits, so the platform restarts the process into a fresh
+ * file — one restart instead of hours of silently lost trails. Not on a boot
+ * that has just reset: then it only logs, rather than looping.
+ */
+function noteDbError(e) {
+  if (!isCorruptionError(e)) return;
+  if (resetThisBoot) {
+    console.error('[history] ❌ Corruption again right after a reset — check the volume/disk:', e.message);
+    return;
+  }
+  console.error('[history] ❌ Database is corrupt — requesting a reset and restarting:', e.message);
+  try {
+    fs.writeFileSync(RESET_REQUEST_PATH, `${e.code}: ${e.message}\n`);
+  } catch (writeErr) {
+    console.error('[history] ❌ Could not request a reset, staying up:', writeErr.message);
+    return;
+  }
+  process.exit(1);
+}
+
+// Close cleanly on shutdown so the WAL is checkpointed. telemetry.cjs turns
+// SIGTERM/SIGINT into process.exit, which is what fires this.
+process.on('exit', () => { try { if (db.open) db.close(); } catch { /* ignore */ } });
 
 // 2. High-Performance & Memory Safety Configuration
 //
@@ -92,8 +192,13 @@ try {
 // container, and mostly wasted now that the hot path touches a small tail row
 // instead of re-reading whole trails. HISTORY_CACHE_MB raises it again on a
 // larger instance.
+//
+// synchronous = NORMAL, not OFF. Under WAL it only syncs at checkpoints, so it
+// costs next to nothing on this write pattern, and it is what keeps the file
+// intact through a host crash or volume detach. OFF does not: that is the
+// likeliest cause of the corruption described above.
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous = OFF');
+db.pragma('synchronous = NORMAL');
 db.pragma(`cache_size = -${intEnv('HISTORY_CACHE_MB', 16) * 1024}`);
 
 // 3. Create Tables
@@ -782,7 +887,12 @@ function updateBatch(flights, sessionId = null) {
     }
   });
 
-  runBatch(flights);
+  try {
+    runBatch(flights);
+  } catch (e) {
+    noteDbError(e);
+    throw e;
+  }
 }
 
 /**
@@ -901,7 +1011,7 @@ setTimeout(() => {
 setInterval(purgeOldData, 60 * 60 * 1000);
 setInterval(() => runDeepClean(), 6 * 60 * 60 * 1000);
 
-// With synchronous=OFF and a steady write stream the WAL file (and the memory
+// With a steady write stream the WAL file (and the memory
 // mapping behind it) keeps growing until a checkpoint reclaims it. Force a
 // truncating checkpoint every 10 minutes to keep it bounded.
 setInterval(() => {
