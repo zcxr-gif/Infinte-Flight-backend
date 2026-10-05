@@ -8,7 +8,6 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'flight_history.db');
 
 // Tunables — change these in one place if you ever need to.
-const MAX_POINTS_PER_FLIGHT = 1500; // was 3000 — halved, since per-point cost dropped ~45%
 const MAX_SESSIONS_PER_FLIGHT = 3;
 const SESSION_GAP_MS = 30 * 60 * 1000;
 const CRUISE_THROTTLE_MS = 120000;
@@ -41,6 +40,14 @@ const RETENTION_HOURS = intEnv('HISTORY_RETENTION_HOURS', 24 * 14);
 const RETENTION_MS = RETENTION_HOURS * 60 * 60 * 1000;
 const MAX_DB_BYTES = intEnv('HISTORY_MAX_DB_MB', 4096) * 1024 * 1024;
 
+/* --- Points per flight ---
+ * There is no cap. Every point the recorder accepts is kept for the life of the
+ * flight. A cap used to drop the oldest points once a trail passed 1500, which
+ * cut the departure off any long flight flown below the cruise throttle. The
+ * throttling in shouldSkipPoint already bounds a trail: a 15-hour flight is a
+ * couple of thousand points, a few bytes each once chunked.
+ */
+
 /* --- Chunking ---
  * Points accumulate in a small hot tail on the flight's own row, which is the
  * only thing rewritten on a normal poll. Once the tail reaches CHUNK_POINTS it
@@ -68,15 +75,115 @@ if (!fs.existsSync(DATA_DIR)) {
 
 console.log(`[history] Database path: ${DB_PATH}`);
 
+/* --- Corruption recovery ---
+ * This database is a rolling cache: finished flights are promoted to the
+ * replay archive (archivist.cjs), and everything else ages out within the
+ * retention window anyway. So when the file is corrupt, the right move is to
+ * start it again — not to limp on with every write failing, which is what
+ * happened in October 2026: `database disk image is malformed` on every poll,
+ * no trails recorded, no flights archived, and nothing to say so but a log line.
+ *
+ * Three ways the file gets reset, all before anything is prepared against it:
+ *
+ *   - ONE_TIME_RESET differs from the tag stored beside the database. Bump it to
+ *     wipe the history once on the next deploy; it never fires twice for the
+ *     same tag. The marker is written before the delete, so a volume that
+ *     cannot hold the marker never has its database deleted on every boot.
+ *   - A reset was requested: a write hit SQLITE_CORRUPT at runtime (see
+ *     noteDbError), which leaves a request file and restarts the process.
+ *   - The file cannot even be opened and read as a database.
+ */
+const ONE_TIME_RESET = '2026-10-04-malformed';
+const RESET_DONE_PATH = DB_PATH + '.reset-done';
+const RESET_REQUEST_PATH = DB_PATH + '.reset-requested';
+
+const isCorruptionError = (e) => /^SQLITE_(CORRUPT|NOTADB)/.test(String(e?.code || ''));
+
+function deleteDatabaseFiles(reason) {
+  console.error(`[history] ⚠️ Resetting flight history (${reason}) — deleting ${DB_PATH}`);
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.rmSync(DB_PATH + suffix, { force: true }); } catch (e) {
+      console.error(`[history] ❌ Could not delete ${DB_PATH + suffix}:`, e.message);
+    }
+  }
+}
+
+// Set when this boot started from a freshly reset file, so a corruption error
+// straight afterwards (a failing disk, say) cannot become a restart loop.
+let resetThisBoot = false;
+
+function readTag(file) {
+  try { return fs.readFileSync(file, 'utf8').trim(); } catch { return null; }
+}
+
+if (readTag(RESET_DONE_PATH) !== ONE_TIME_RESET) {
+  let marked = false;
+  try { fs.writeFileSync(RESET_DONE_PATH, ONE_TIME_RESET + '\n'); marked = true; } catch (e) {
+    console.error('[history] ❌ Could not record the one-time reset, skipping it:', e.message);
+  }
+  if (marked && fs.existsSync(DB_PATH)) {
+    deleteDatabaseFiles(`one-time reset ${ONE_TIME_RESET}`);
+    resetThisBoot = true;
+  }
+}
+
+if (fs.existsSync(RESET_REQUEST_PATH)) {
+  deleteDatabaseFiles(`requested: ${readTag(RESET_REQUEST_PATH) || 'corruption detected'}`);
+  try { fs.rmSync(RESET_REQUEST_PATH, { force: true }); } catch { /* retried next boot */ }
+  resetThisBoot = true;
+}
+
+// Opening succeeds on most corrupt files; reading the schema is what fails, so
+// do that here, while a fresh start is still free.
+function openDatabase() {
+  const handle = new Database(DB_PATH);
+  handle.pragma('journal_mode = WAL');
+  handle.prepare('SELECT COUNT(*) FROM sqlite_master').get();
+  return handle;
+}
+
 // 1. Initialize the DB
 let db;
 try {
-  db = new Database(DB_PATH);
+  try {
+    db = openDatabase();
+  } catch (e) {
+    if (!isCorruptionError(e)) throw e;
+    deleteDatabaseFiles(`unreadable at startup: ${e.message}`);
+    resetThisBoot = true;
+    db = openDatabase();
+  }
 } catch (e) {
   console.error('[history] ❌ CRITICAL DATABASE ERROR:', e.message);
   console.warn('[history] Falling back to in-memory database (Data will not persist!)');
   db = new Database(':memory:');
 }
+
+/**
+ * Called with any error a write to this database throws. On corruption it asks
+ * for a reset and exits, so the platform restarts the process into a fresh
+ * file — one restart instead of hours of silently lost trails. Not on a boot
+ * that has just reset: then it only logs, rather than looping.
+ */
+function noteDbError(e) {
+  if (!isCorruptionError(e)) return;
+  if (resetThisBoot) {
+    console.error('[history] ❌ Corruption again right after a reset — check the volume/disk:', e.message);
+    return;
+  }
+  console.error('[history] ❌ Database is corrupt — requesting a reset and restarting:', e.message);
+  try {
+    fs.writeFileSync(RESET_REQUEST_PATH, `${e.code}: ${e.message}\n`);
+  } catch (writeErr) {
+    console.error('[history] ❌ Could not request a reset, staying up:', writeErr.message);
+    return;
+  }
+  process.exit(1);
+}
+
+// Close cleanly on shutdown so the WAL is checkpointed. telemetry.cjs turns
+// SIGTERM/SIGINT into process.exit, which is what fires this.
+process.on('exit', () => { try { if (db.open) db.close(); } catch { /* ignore */ } });
 
 // 2. High-Performance & Memory Safety Configuration
 //
@@ -85,8 +192,13 @@ try {
 // container, and mostly wasted now that the hot path touches a small tail row
 // instead of re-reading whole trails. HISTORY_CACHE_MB raises it again on a
 // larger instance.
+//
+// synchronous = NORMAL, not OFF. Under WAL it only syncs at checkpoints, so it
+// costs next to nothing on this write pattern, and it is what keeps the file
+// intact through a host crash or volume detach. OFF does not: that is the
+// likeliest cause of the corruption described above.
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous = OFF');
+db.pragma('synchronous = NORMAL');
 db.pragma(`cache_size = -${intEnv('HISTORY_CACHE_MB', 16) * 1024}`);
 
 // 3. Create Tables
@@ -442,6 +554,29 @@ function getDistanceNM(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
+// Faster than anything in Infinite Flight, Concorde with a jet stream behind
+// it included. A jump that would need more than this is a different flight.
+const TELEPORT_MIN_NM = 50;
+const TELEPORT_MIN_KT = 1500;
+
+/**
+ * Does p2 start a new session after p1?
+ *
+ * A long time gap, or a jump no aircraft could fly in the time between the two
+ * points. Distance alone is not enough: points are 15 s apart near the ground
+ * but 2 min apart in cruise, so a few missed polls (a 429 backoff, a redeploy)
+ * put two honest cruise points 50+ nm apart. Read as a "teleport", that marked
+ * a session break, and on the third one enforceTrailLimits deleted everything
+ * before it — the front of the flight, gone, while the pilot was still flying.
+ */
+function isSessionBreak(p1, p2, sessionGapMs = SESSION_GAP_MS) {
+  const dtMs = p2.time - p1.time;
+  if (dtMs > sessionGapMs) return true;
+  const nm = getDistanceNM(p1.lat, p1.lon, p2.lat, p2.lon);
+  if (nm <= TELEPORT_MIN_NM) return false;
+  return dtMs <= 0 || nm / (dtMs / 3600000) > TELEPORT_MIN_KT;
+}
+
 /**
  * Keeps only the last N flight sessions within the path array.
  */
@@ -451,13 +586,7 @@ function trimFlightSessions(pathArray, maxSessions = MAX_SESSIONS_PER_FLIGHT, se
   const sessionBoundaries = [];
 
   for (let i = 1; i < pathArray.length; i++) {
-    const p1 = pathArray[i - 1];
-    const p2 = pathArray[i];
-
-    const isTimeGap = (p2.time - p1.time) > sessionGapMs;
-    const isTeleport = getDistanceNM(p1.lat, p1.lon, p2.lat, p2.lon) > 50;
-
-    if (isTimeGap || isTeleport) {
+    if (isSessionBreak(pathArray[i - 1], pathArray[i], sessionGapMs)) {
       sessionBoundaries.push(i);
     }
   }
@@ -466,10 +595,6 @@ function trimFlightSessions(pathArray, maxSessions = MAX_SESSIONS_PER_FLIGHT, se
     const sessionsToRemove = sessionBoundaries.length - maxSessions + 1;
     const sliceIndex = sessionBoundaries[sessionsToRemove - 1];
     pathArray = pathArray.slice(sliceIndex);
-  }
-
-  if (pathArray.length > MAX_POINTS_PER_FLIGHT) {
-    return pathArray.slice(-MAX_POINTS_PER_FLIGHT);
   }
 
   return pathArray;
@@ -487,10 +612,6 @@ const insertChunkStmt = db.prepare(
   'INSERT OR REPLACE INTO flight_path_chunks (flightId, seq, points, chunk) VALUES (?, ?, ?, ?)'
 );
 const deleteFlightChunksStmt = db.prepare('DELETE FROM flight_path_chunks WHERE flightId = ?');
-const listChunkSizesStmt = db.prepare(
-  'SELECT seq, points FROM flight_path_chunks WHERE flightId = ? ORDER BY seq'
-);
-const dropChunkStmt = db.prepare('DELETE FROM flight_path_chunks WHERE flightId = ? AND seq = ?');
 const selectFlightRowStmt = db.prepare(
   'SELECT path_json, tail_blob FROM flight_history WHERE flightId = ?'
 );
@@ -596,49 +717,30 @@ function runDeepClean(batchSize = 500) {
 function countSessionBreaks(pathArray) {
   let breaks = 0;
   for (let i = 1; i < pathArray.length; i++) {
-    const p1 = pathArray[i - 1];
-    const p2 = pathArray[i];
-    if ((p2.time - p1.time) > SESSION_GAP_MS || getDistanceNM(p1.lat, p1.lon, p2.lat, p2.lon) > 50) {
-      breaks++;
-    }
+    if (isSessionBreak(pathArray[i - 1], pathArray[i])) breaks++;
   }
   return breaks;
 }
 
 /**
- * Applies the size and session limits to a flight that has just sealed a chunk.
+ * Applies the session limit to a flight that has just sealed a chunk.
  *
- * The cheap case — too many points — drops whole chunk rows off the front,
- * which needs no decoding at all. Only a flight that has accumulated more
- * sessions than we keep gets the full decode-trim-rewrite, and that needs three
- * separate departures logged under one flightId to trigger.
- *
- * Limits are therefore enforced at chunk granularity: a trail can run up to
- * CHUNK_POINTS over MAX_POINTS_PER_FLIGHT before the next seal pulls it back.
- * That slack is the entire point — it is what keeps the common poll O(1).
+ * Only a flight with more genuine sessions (see isSessionBreak) logged under
+ * one flightId than we keep pays the decode-trim-rewrite; every other seal is a
+ * single counter check, which is what keeps the common poll O(1).
  */
 function enforceTrailLimits(flightId, state) {
-  if (state.sessionBreaks >= MAX_SESSIONS_PER_FLIGHT) {
-    const trimmed = trimFlightSessions(assemblePath(flightId, { tail_blob: null }));
-    const { chunkSeq, tail } = rewriteTrail(flightId, trimmed);
-    state.chunkSeq = chunkSeq;
-    state.tail = tail;
-    state.pointCount = trimmed.length;
-    state.sessionBreaks = countSessionBreaks(trimmed);
-    return;
-  }
-
-  if (state.pointCount <= MAX_POINTS_PER_FLIGHT) return;
-
-  for (const c of listChunkSizesStmt.all(flightId)) {
-    if (state.pointCount - c.points < MAX_POINTS_PER_FLIGHT) break;
-    dropChunkStmt.run(flightId, c.seq);
-    state.pointCount -= c.points;
-  }
+  if (state.sessionBreaks < MAX_SESSIONS_PER_FLIGHT) return;
+  const trimmed = trimFlightSessions(assemblePath(flightId, { tail_blob: null }));
+  const { chunkSeq, tail } = rewriteTrail(flightId, trimmed);
+  state.chunkSeq = chunkSeq;
+  state.tail = tail;
+  state.pointCount = trimmed.length;
+  state.sessionBreaks = countSessionBreaks(trimmed);
 }
 
 const selectFlightStateStmt = db.prepare(
-  'SELECT path_json, tail_blob, last_point, point_count, session_breaks, chunk_seq FROM flight_history WHERE flightId = ?'
+  'SELECT path_json, tail_blob, last_point, point_count, session_breaks, chunk_seq, lastSeen FROM flight_history WHERE flightId = ?'
 );
 
 const upsertFlightStmt = db.prepare(`
@@ -665,6 +767,9 @@ const upsertFlightStmt = db.prepare(`
 
 const touchLastSeenStmt = db.prepare('UPDATE flight_history SET lastSeen = ? WHERE flightId = ?');
 
+// Saves land every 15 s per flight; a minute without one means polls were missed.
+const REAPPEAR_GAP_MS = 60 * 1000;
+
 /**
  * Optimized Batch Update
  *
@@ -688,6 +793,14 @@ function updateBatch(flights, sessionId = null) {
   const runBatch = db.transaction((flightList) => {
     for (const flight of flightList) {
       const row = selectFlightStateStmt.get(flight.flightId);
+
+      // Back after a gap (missed polls, a redeploy): the archivist may have
+      // taken it for finished and stored the trail so far. Reopen its claim so
+      // the whole flight is archived again when it really ends — the archive
+      // merges by timestamp, so the second upload completes the first.
+      if (row && row.lastSeen && now - row.lastSeen > REAPPEAR_GAP_MS) {
+        releaseFlightState(flight.flightId, 'archived');
+      }
 
       // A row written by the previous build still carries its trail as JSON.
       // Convert it here rather than waiting for the sweep — this flight is
@@ -741,11 +854,7 @@ function updateBatch(flights, sessionId = null) {
       // Session boundaries are spotted as they happen — the same test the old
       // full-array walk applied, just against the one point that can create a
       // new boundary instead of re-walking everything recorded so far.
-      if (state.lastPoint) {
-        const isTimeGap = (point.time - state.lastPoint.time) > SESSION_GAP_MS;
-        const isTeleport = getDistanceNM(state.lastPoint.lat, state.lastPoint.lon, point.lat, point.lon) > 50;
-        if (isTimeGap || isTeleport) state.sessionBreaks++;
-      }
+      if (state.lastPoint && isSessionBreak(state.lastPoint, point)) state.sessionBreaks++;
 
       state.tail.push(point);
       state.pointCount++;
@@ -778,7 +887,12 @@ function updateBatch(flights, sessionId = null) {
     }
   });
 
-  runBatch(flights);
+  try {
+    runBatch(flights);
+  } catch (e) {
+    noteDbError(e);
+    throw e;
+  }
 }
 
 /**
@@ -897,7 +1011,7 @@ setTimeout(() => {
 setInterval(purgeOldData, 60 * 60 * 1000);
 setInterval(() => runDeepClean(), 6 * 60 * 60 * 1000);
 
-// With synchronous=OFF and a steady write stream the WAL file (and the memory
+// With a steady write stream the WAL file (and the memory
 // mapping behind it) keeps growing until a checkpoint reclaims it. Force a
 // truncating checkpoint every 10 minutes to keep it bounded.
 setInterval(() => {
@@ -915,6 +1029,8 @@ module.exports = {
   claimFlightState,
   releaseFlightState,
   purgeOldData,
+  // Exposed for tests.
+  isSessionBreak,
   // Exposed for path_codec.test.cjs, which asserts against the stored shape
   // (chunk rows, hot-tail size) and not just the decoded trail.
   _db: db
